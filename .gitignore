@@ -1,0 +1,9 @@
+.DS_Store
+
+# custom
+art/*
+!art/.gitkeep
+output/*
+!output/.gitkeep
+songs/*
+!songs/.gitkeep
