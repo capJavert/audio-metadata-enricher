@@ -3,6 +3,7 @@ import argparse
 import json
 import shlex
 import subprocess
+import tempfile
 from pathlib import Path
 
 def is_media_file(p: Path) -> bool:
@@ -13,6 +14,71 @@ def sorted_media_files_from_dir(d: Path):
     files = [p for p in d.iterdir() if p.is_file() and is_media_file(p)]
     return sorted(files, key=lambda p: p.name.lower())
 
+def extract_cover_from_id3(inp: Path) -> Path | None:
+    """Extract cover art directly from MP3 ID3v2 APIC frame, bypassing ffmpeg codec detection."""
+    try:
+        with open(inp, 'rb') as f:
+            header = f.read(10)
+            if len(header) < 10 or header[:3] != b'ID3':
+                return None
+            major = header[3]
+            size = ((header[6] & 0x7f) << 21) | ((header[7] & 0x7f) << 14) | \
+                   ((header[8] & 0x7f) << 7) | (header[9] & 0x7f)
+            tag_data = f.read(size)
+    except OSError:
+        return None
+
+    pos = 0
+    while pos < len(tag_data) - 10:
+        fid = tag_data[pos:pos+4]
+        if fid[0] == 0:
+            break
+        if major == 4:  # ID3v2.4 syncsafe frame size
+            fs = ((tag_data[pos+4] & 0x7f) << 21) | ((tag_data[pos+5] & 0x7f) << 14) | \
+                 ((tag_data[pos+6] & 0x7f) << 7) | (tag_data[pos+7] & 0x7f)
+        else:  # ID3v2.3 big-endian frame size
+            fs = int.from_bytes(tag_data[pos+4:pos+8], 'big')
+        frame_data = tag_data[pos+10:pos+10+fs]
+
+        if fid == b'APIC' and len(frame_data) > 4:
+            enc = frame_data[0]
+            try:
+                null1 = frame_data.index(0, 1)
+            except ValueError:
+                pos += 10 + fs
+                continue
+            # Skip: mime type, picture type byte, then null-terminated description
+            desc_start = null1 + 2
+            if enc in (0, 3):  # Latin-1 or UTF-8
+                try:
+                    null2 = frame_data.index(0, desc_start)
+                except ValueError:
+                    null2 = desc_start
+                img_data = frame_data[null2+1:]
+            elif enc in (1, 2):  # UTF-16
+                j = desc_start
+                while j < len(frame_data) - 1:
+                    if frame_data[j] == 0 and frame_data[j+1] == 0:
+                        break
+                    j += 1
+                img_data = frame_data[j+2:]
+            else:
+                img_data = frame_data[desc_start:]
+
+            if len(img_data) < 4:
+                pos += 10 + fs
+                continue
+
+            # Detect actual format from magic bytes, not the (possibly wrong) mime type
+            ext = ".png" if img_data[:4] == b'\x89PNG' else ".jpg"
+            tmp = Path(tempfile.mktemp(suffix=ext))
+            tmp.write_bytes(img_data)
+            return tmp
+
+        pos += 10 + fs
+    return None
+
+
 def build_ffmpeg_cmd(inp: Path, outp: Path, meta: dict, cover: Path | None, yes: bool):
     cmd = ["ffmpeg", "-hide_banner"]
     cmd += ["-y"] if yes else ["-n"]
@@ -22,12 +88,13 @@ def build_ffmpeg_cmd(inp: Path, outp: Path, meta: dict, cover: Path | None, yes:
     have_cover = cover is not None
     if have_cover:
         cmd += ["-i", str(cover)]
-        # Keep everything, add cover stream
-        cmd += ["-map", "0", "-map", "1"]
+        # Take only audio from input, artwork from cover file
+        cmd += ["-map", "0:a", "-map", "1"]
         cmd += ["-c", "copy"]
         # Mark the artwork stream as attached picture
         cmd += ["-disposition:v:0", "attached_pic"]
     else:
+        cmd += ["-map", "0:a"]
         cmd += ["-c", "copy"]
 
     # Replace existing metadata entirely, then apply ours
@@ -127,6 +194,12 @@ def main():
         except FileNotFoundError as e:
             raise SystemExit(str(e))
 
+        # If no explicit cover, try to preserve existing embedded art
+        temp_cover = None
+        if cover is None and inp.suffix.lower() == ".mp3":
+            temp_cover = extract_cover_from_id3(inp)
+            cover = temp_cover
+
         out_name = inp.stem + args.suffix + inp.suffix
         outp = outdir / out_name
 
@@ -134,10 +207,17 @@ def main():
 
         if args.dry_run:
             print(" ".join(shlex.quote(x) for x in cmd))
+            if temp_cover:
+                temp_cover.unlink(missing_ok=True)
             continue
 
-        print(f"[{i+1}/{n}] {inp.name} -> {outp.name}" + (f" (art: {cover.name})" if cover else ""))
+        art_label = f" (art: {cover.name})" if cover else ""
+        if temp_cover:
+            art_label = " (art: existing)"
+        print(f"[{i+1}/{n}] {inp.name} -> {outp.name}{art_label}")
         res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if temp_cover:
+            temp_cover.unlink(missing_ok=True)
         if res.returncode != 0:
             print(res.stderr)
             raise SystemExit(f"ffmpeg failed on: {inp}")
