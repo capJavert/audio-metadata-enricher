@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import re
 import shlex
 import subprocess
 import tempfile
+from datetime import datetime
 from pathlib import Path
 
 def is_media_file(p: Path) -> bool:
     exts = {".mp3", ".m4a", ".mp4", ".mov", ".mkv", ".flac", ".wav", ".ogg", ".opus", ".aac", ".webm"}
     return p.suffix.lower() in exts
 
+def natural_sort_key(p: Path):
+    return [int(s) if s.isdigit() else s.lower() for s in re.split(r'(\d+)', p.name)]
+
 def sorted_media_files_from_dir(d: Path):
     files = [p for p in d.iterdir() if p.is_file() and is_media_file(p)]
-    return sorted(files, key=lambda p: p.name.lower())
+    return sorted(files, key=natural_sort_key)
 
 def extract_cover_from_id3(inp: Path) -> Path | None:
     """Extract cover art directly from MP3 ID3v2 APIC frame, bypassing ffmpeg codec detection."""
@@ -97,8 +102,8 @@ def build_ffmpeg_cmd(inp: Path, outp: Path, meta: dict, cover: Path | None, yes:
         cmd += ["-map", "0:a"]
         cmd += ["-c", "copy"]
 
-    # Replace existing metadata entirely, then apply ours
-    cmd += ["-map_metadata", "-1"]
+    # Keep existing metadata, only override fields specified below
+    cmd += ["-map_metadata", "0"]
 
     # Apply metadata keys; skip image key and empty values
     for k, v in meta.items():
