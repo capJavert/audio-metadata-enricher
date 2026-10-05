@@ -132,7 +132,10 @@ def build_ffmpeg_cmd(inp: Path, outp: Path, meta: dict, cover: Path | None, yes:
 
     cmd += ["-i", str(inp)]
 
-    is_mp4 = outp.suffix.lower() in MP4_EXTS
+    out_ext = outp.suffix.lower()
+    is_mp4 = out_ext in MP4_EXTS
+    # Re-encode only when converting a non-mp3 input to mp3 (--to-mp3)
+    to_mp3 = out_ext == ".mp3" and inp.suffix.lower() != ".mp3"
 
     have_cover = cover is not None
     if have_cover:
@@ -140,18 +143,21 @@ def build_ffmpeg_cmd(inp: Path, outp: Path, meta: dict, cover: Path | None, yes:
         # Take only audio from input, artwork from cover file
         cmd += ["-map", "0:a", "-map", "1"]
         cmd += ["-c", "copy"]
-        # MP4 cover art only supports JPEG/PNG, convert anything else
-        if is_mp4 and cover.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
+        # MP4/MP3 cover art only reliably supports JPEG/PNG, convert anything else
+        if (is_mp4 or out_ext == ".mp3") and cover.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
             cmd += ["-c:v", "mjpeg"]
         # Mark the artwork stream as attached picture
         cmd += ["-disposition:v:0", "attached_pic"]
-    elif is_mp4:
+    elif is_mp4 or to_mp3:
         # Keep existing embedded artwork (ffmpeg reads MP4 cover art fine)
         cmd += ["-map", "0:a", "-map", "0:v?"]
         cmd += ["-c", "copy"]
     else:
         cmd += ["-map", "0:a"]
         cmd += ["-c", "copy"]
+
+    if to_mp3:
+        cmd += ["-c:a", "libmp3lame", "-q:a", "0"]
 
     # Keep existing metadata, only override fields specified below
     cmd += ["-map_metadata", "0"]
@@ -173,8 +179,11 @@ def build_ffmpeg_cmd(inp: Path, outp: Path, meta: dict, cover: Path | None, yes:
         # Generic mp4 muxer instead of the default ipod one for .m4a, which
         # rejects codecs like Opus. Writes standard iTunes tags and cover art.
         cmd += ["-f", "mp4"]
-    elif outp.suffix.lower() == ".mov":
+    elif out_ext == ".mov":
         cmd += ["-movflags", "use_metadata_tags"]
+    elif out_ext == ".mp3":
+        # ID3v2.3 has the widest player support (Spotify, Windows, older devices)
+        cmd += ["-id3v2_version", "3"]
 
     cmd += [str(outp)]
     return cmd
@@ -211,6 +220,7 @@ def main():
     ap.add_argument("--outdir", required=True, help="Output directory.")
     ap.add_argument("--suffix", default="", help="Optional suffix before extension, e.g. '_tagged'.")
     ap.add_argument("--cover", help="Optional default cover image (path or http(s) URL) used when an entry has no 'image'.")
+    ap.add_argument("--to-mp3", action="store_true", help="Convert non-mp3 inputs to mp3 (high-quality VBR); mp3 inputs are copied as-is.")
     ap.add_argument("--dry-run", action="store_true", help="Print ffmpeg commands but do not run them.")
     ap.add_argument("-y", "--yes", action="store_true", help="Overwrite outputs if they exist.")
     args = ap.parse_args()
@@ -278,7 +288,8 @@ def run(args, json_path: Path, json_base: Path, outdir: Path):
             temp_cover = extract_cover_from_id3(inp)
             cover = temp_cover
 
-        out_name = inp.stem + args.suffix + inp.suffix
+        out_ext = ".mp3" if args.to_mp3 else inp.suffix
+        out_name = inp.stem + args.suffix + out_ext
         outp = outdir / out_name
 
         cmd = build_ffmpeg_cmd(inp, outp, meta, cover, args.yes)

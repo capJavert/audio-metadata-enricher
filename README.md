@@ -71,6 +71,7 @@ Tips:
 - `--files <paths...>` — specify an explicit ordered list instead of scanning a directory.
 - `--suffix _tagged` — append a suffix before the extension when writing output files.
 - `--cover path/to/default.jpg` — fallback artwork (path or URL) when a JSON entry omits `image`.
+- `--to-mp3` — convert non-mp3 inputs (e.g. Opus/AAC `.m4a`) to high-quality VBR mp3 with ID3v2.3 tags, keeping artwork. Useful for players like Spotify local files that can't play Opus. Existing mp3 inputs are never re-encoded.
 - `--dry-run` — print the generated `ffmpeg` commands without executing them.
 - `-y/--yes` — overwrite outputs if they already exist.
 

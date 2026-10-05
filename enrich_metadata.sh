@@ -4,4 +4,5 @@ python3 apply_meta.py \
   --outdir ./output \
   --suffix "" \
   --yes \
+  --to-mp3 \
 #   --dry-run \
