@@ -24,7 +24,7 @@ Apply ordered metadata (including per-track cover art) to a batch of audio or vi
 1. Adjust `album.json` (or your chosen filename) to include desired metadata.
 2. Ensure the JSON root is an array; each element corresponds to one media file.
 3. Supported keys are passed directly to `ffmpeg` as `-metadata` values (for example: `title`, `artist`, `album`, `track`).
-4. Optional `image` entries point to artwork files. Use paths relative to the JSON file or absolute paths.
+4. Optional `image` entries point to artwork files. Use paths relative to the JSON file, absolute paths, or `http(s)://` URLs (downloaded to a temp file and cleaned up after the run).
 
 ```json
 [
@@ -70,7 +70,7 @@ Tips:
 
 - `--files <paths...>` — specify an explicit ordered list instead of scanning a directory.
 - `--suffix _tagged` — append a suffix before the extension when writing output files.
-- `--cover path/to/default.jpg` — fallback artwork when a JSON entry omits `image`.
+- `--cover path/to/default.jpg` — fallback artwork (path or URL) when a JSON entry omits `image`.
 - `--dry-run` — print the generated `ffmpeg` commands without executing them.
 - `-y/--yes` — overwrite outputs if they already exist.
 

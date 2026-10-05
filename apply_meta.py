@@ -5,8 +5,46 @@ import re
 import shlex
 import subprocess
 import tempfile
+import urllib.request
 from datetime import datetime
 from pathlib import Path
+
+# Cache of downloaded artwork so the same URL is fetched only once per run
+_downloaded_covers: dict[str, Path] = {}
+
+def is_url(s: str) -> bool:
+    return s.lower().startswith(("http://", "https://"))
+
+def download_cover(url: str) -> Path:
+    """Download artwork from URL into a temp file and return its path."""
+    if url in _downloaded_covers:
+        return _downloaded_covers[url]
+    req = urllib.request.Request(url, headers={"User-Agent": "audio-metadata-enricher"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as res:
+            data = res.read()
+    except OSError as e:
+        raise FileNotFoundError(f"Failed to download artwork: {url} ({e})")
+    if len(data) < 4:
+        raise FileNotFoundError(f"Downloaded artwork is empty: {url}")
+    # Detect format from magic bytes, URL may not have a usable extension
+    if data[:4] == b'\x89PNG':
+        ext = ".png"
+    elif data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+        ext = ".webp"
+    else:
+        ext = ".jpg"
+    fd, name = tempfile.mkstemp(suffix=ext)
+    with open(fd, "wb") as f:
+        f.write(data)
+    tmp = Path(name)
+    _downloaded_covers[url] = tmp
+    return tmp
+
+def cleanup_downloaded_covers():
+    for tmp in _downloaded_covers.values():
+        tmp.unlink(missing_ok=True)
+    _downloaded_covers.clear()
 
 def is_media_file(p: Path) -> bool:
     exts = {".mp3", ".m4a", ".mp4", ".mov", ".mkv", ".flac", ".wav", ".ogg", ".opus", ".aac", ".webm"}
@@ -84,11 +122,17 @@ def extract_cover_from_id3(inp: Path) -> Path | None:
     return None
 
 
+# Note: -movflags use_metadata_tags must not be used for these, it replaces
+# iTunes tags with mdta keys most players ignore and drops cover art
+MP4_EXTS = {".m4a", ".mp4"}
+
 def build_ffmpeg_cmd(inp: Path, outp: Path, meta: dict, cover: Path | None, yes: bool):
     cmd = ["ffmpeg", "-hide_banner"]
     cmd += ["-y"] if yes else ["-n"]
 
     cmd += ["-i", str(inp)]
+
+    is_mp4 = outp.suffix.lower() in MP4_EXTS
 
     have_cover = cover is not None
     if have_cover:
@@ -96,8 +140,15 @@ def build_ffmpeg_cmd(inp: Path, outp: Path, meta: dict, cover: Path | None, yes:
         # Take only audio from input, artwork from cover file
         cmd += ["-map", "0:a", "-map", "1"]
         cmd += ["-c", "copy"]
+        # MP4 cover art only supports JPEG/PNG, convert anything else
+        if is_mp4 and cover.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
+            cmd += ["-c:v", "mjpeg"]
         # Mark the artwork stream as attached picture
         cmd += ["-disposition:v:0", "attached_pic"]
+    elif is_mp4:
+        # Keep existing embedded artwork (ffmpeg reads MP4 cover art fine)
+        cmd += ["-map", "0:a", "-map", "0:v?"]
+        cmd += ["-c", "copy"]
     else:
         cmd += ["-map", "0:a"]
         cmd += ["-c", "copy"]
@@ -118,8 +169,11 @@ def build_ffmpeg_cmd(inp: Path, outp: Path, meta: dict, cover: Path | None, yes:
             continue
         cmd += ["-metadata", f"{k}={s}"]
 
-    # MP4/M4A helpful flag (ignored by other muxers)
-    if outp.suffix.lower() in {".m4a", ".mp4", ".mov"}:
+    if is_mp4:
+        # Generic mp4 muxer instead of the default ipod one for .m4a, which
+        # rejects codecs like Opus. Writes standard iTunes tags and cover art.
+        cmd += ["-f", "mp4"]
+    elif outp.suffix.lower() == ".mov":
         cmd += ["-movflags", "use_metadata_tags"]
 
     cmd += [str(outp)]
@@ -127,14 +181,19 @@ def build_ffmpeg_cmd(inp: Path, outp: Path, meta: dict, cover: Path | None, yes:
 
 def resolve_cover_for_entry(meta: dict, json_base: Path, global_cover: Path | None) -> Path | None:
     """
-    If meta has 'image', use it (resolved relative to the JSON file directory).
+    If meta has 'image', use it (http(s) URLs are downloaded to a temp file,
+    paths are resolved relative to the JSON file directory).
     Otherwise use global_cover if provided.
     """
     img = meta.get("image")
     if img is None or str(img).strip() == "":
         return global_cover
 
-    p = Path(str(img))
+    img = str(img).strip()
+    if is_url(img):
+        return download_cover(img)
+
+    p = Path(img)
     if not p.is_absolute():
         p = (json_base / p).resolve()
 
@@ -151,7 +210,7 @@ def main():
     ap.add_argument("--files", nargs="*", help="Explicit list of input files (keeps given order).")
     ap.add_argument("--outdir", required=True, help="Output directory.")
     ap.add_argument("--suffix", default="", help="Optional suffix before extension, e.g. '_tagged'.")
-    ap.add_argument("--cover", help="Optional default cover image used when an entry has no 'image'.")
+    ap.add_argument("--cover", help="Optional default cover image (path or http(s) URL) used when an entry has no 'image'.")
     ap.add_argument("--dry-run", action="store_true", help="Print ffmpeg commands but do not run them.")
     ap.add_argument("-y", "--yes", action="store_true", help="Overwrite outputs if they exist.")
     args = ap.parse_args()
@@ -161,9 +220,23 @@ def main():
     outdir = Path(args.outdir).resolve()
     outdir.mkdir(parents=True, exist_ok=True)
 
-    global_cover = Path(args.cover).resolve() if args.cover else None
-    if global_cover and not global_cover.exists():
-        raise SystemExit(f"Global cover not found: {global_cover}")
+    try:
+        run(args, json_path, json_base, outdir)
+    finally:
+        cleanup_downloaded_covers()
+
+def run(args, json_path: Path, json_base: Path, outdir: Path):
+    global_cover = None
+    if args.cover:
+        if is_url(args.cover):
+            try:
+                global_cover = download_cover(args.cover)
+            except FileNotFoundError as e:
+                raise SystemExit(str(e))
+        else:
+            global_cover = Path(args.cover).resolve()
+            if not global_cover.exists():
+                raise SystemExit(f"Global cover not found: {global_cover}")
 
     # Load JSON array
     with json_path.open("r", encoding="utf-8") as f:
@@ -217,6 +290,9 @@ def main():
             continue
 
         art_label = f" (art: {cover.name})" if cover else ""
+        img = str(meta.get("image") or "").strip()
+        if cover and is_url(img):
+            art_label = f" (art: {img})"
         if temp_cover:
             art_label = " (art: existing)"
         print(f"[{i+1}/{n}] {inp.name} -> {outp.name}{art_label}")
